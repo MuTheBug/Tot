@@ -214,8 +214,14 @@ class FuturesExchange:
 
         Some Binance accounts reject `closePosition=true` with -4120
         ("Algo Order API endpoints instead"). We cache that fact so we
-        stop retrying the unsupported form on every call.
+        stop retrying the unsupported form on every call. If the qty
+        form also gets rejected once, we cache that as well and
+        short-circuit future calls to zero API requests.
         """
+        # Fast path: account is already known to refuse STOP_MARKET.
+        if self.stop_orders_supported is False:
+            return None
+
         stop_price = self.round_price(symbol, stop_price)
 
         def _place(close_pos: bool) -> Dict[str, Any]:
