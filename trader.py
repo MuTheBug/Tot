@@ -36,6 +36,16 @@ class SymbolTrader:
 
     # --------- main tick ---------
     def on_tick(self) -> None:
+        trade = self.store.get(self.symbol)
+        has_local_trade = trade is not None
+        open_count = len(self.store.all())
+        at_cap = open_count >= self.cfg.max_open_positions
+
+        # If we don't already own a trade on this symbol AND the global cap
+        # is reached, there's nothing to do here — skip the kline fetch.
+        if not has_local_trade and at_cap:
+            return
+
         df = self.ex.klines(self.symbol, self.cfg.timeframe, self.cfg.candle_limit)
         if df.empty:
             return
@@ -51,16 +61,21 @@ class SymbolTrader:
         new_bar = latest_bar_open != self._last_bar_open
         self._last_bar_open = latest_bar_open
 
-        # Always manage an existing position (trail stop / detect exits) even
-        # if no new bar just closed.
-        trade = self.store.get(self.symbol)
-        if trade is not None:
+        # Manage an existing position (trail stop / software stop / detect
+        # exits) on every tick, regardless of whether a new bar closed.
+        if has_local_trade:
             self._manage_open_trade(df, trade)
+            return  # never evaluate new entries on a symbol that already holds one
 
-        # Only evaluate new entries on a freshly closed bar and if flat.
+        # Entries only on a freshly closed bar and only if flat both locally
+        # and on the exchange.
         if not new_bar:
             return
         if self.ex.has_open_position(self.symbol):
+            return
+        # Re-check the cap right before signal evaluation in case another
+        # symbol opened a trade earlier in this same tick batch.
+        if len(self.store.all()) >= self.cfg.max_open_positions:
             return
 
         sig = detect_signal(
@@ -76,6 +91,9 @@ class SymbolTrader:
 
     # --------- entries ---------
     def _enter(self, df: pd.DataFrame, sig: Signal) -> None:
+        # Hard cap: never place a second entry while another is open.
+        if len(self.store.all()) >= self.cfg.max_open_positions:
+            return
         filt = self.ex.symbol_filters(self.symbol)
         try:
             balance = self.ex.wallet_balance_usdt()

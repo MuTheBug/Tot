@@ -107,8 +107,31 @@ python bot.py
 | `BREAK_MIN_TOUCHES` | Touchpoints required for a break | `2` |
 | `MIN_BARS_BETWEEN_TOUCHES` | First touch → entry min distance | `42` (= 1 week on 4h) |
 | `TRENDLINE_TOLERANCE` | Touch distance vs. line (fraction) | `0.0035` |
+| `MAX_OPEN_POSITIONS` | Cap on concurrent open positions across all symbols | `1` |
 | `POLL_INTERVAL` | Seconds between scans | `60` |
 | `DRY_RUN` | `true` = alerts only, no orders | `false` |
+
+## Stop-loss / take-profit handling
+
+- The playbook deliberately has **no fixed take-profit** — the trailing
+  *safety line* IS the exit. The bot trails the safety line every closed
+  4h bar (snapped below each new valid swing low for longs / above each new
+  swing high for shorts) and closes the trade the moment a candle **closes
+  through** the line.
+- The protective stop is normally placed on the exchange as a `STOP_MARKET`.
+  If your account refuses that order type (some Binance accounts do, with
+  error `-4120`), the bot transparently switches to a **software-managed
+  stop**: every `POLL_INTERVAL` it polls the mark price and market-closes
+  the position if the safety line is breached. Software stops only fire
+  while the bot process is running — supervise it with systemd / pm2 / tmux.
+
+## One-position-at-a-time mode
+
+By default `MAX_OPEN_POSITIONS=1`, so the bot will never open a new trade
+while another is live. Set higher (e.g. `3`) to let multiple uncorrelated
+setups run in parallel. While at the cap, the scanner skips kline fetches
+for any flat symbol — only the symbol holding the open position is updated
+each tick — which keeps API usage low even with `SYMBOLS=AUTO`.
 
 ## Disclaimer
 

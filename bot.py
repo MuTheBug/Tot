@@ -88,6 +88,7 @@ def main() -> int:
         f"Symbols ({len(cfg.symbols)}): {sym_preview}\n"
         f"TF: {cfg.timeframe}   Risk: {cfg.risk_per_trade:.2%}\n"
         f"Leverage cap: x{cfg.max_leverage}\n"
+        f"Max concurrent positions: {cfg.max_open_positions}\n"
         f"Balance: {bal:.2f} USDT",
         "🚀",
     )

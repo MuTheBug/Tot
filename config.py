@@ -86,6 +86,7 @@ class Config:
     candle_limit: int = field(default_factory=lambda: _get_int("CANDLE_LIMIT", 500))
 
     top_volume_count: int = field(default_factory=lambda: _get_int("TOP_VOLUME_COUNT", 50))
+    max_open_positions: int = field(default_factory=lambda: _get_int("MAX_OPEN_POSITIONS", 1))
 
     poll_interval: int = field(default_factory=lambda: _get_int("POLL_INTERVAL", 60))
     dry_run: bool = field(default_factory=lambda: _get_bool("DRY_RUN", False))
