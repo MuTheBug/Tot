@@ -29,14 +29,29 @@ def _get_int(name: str, default: int) -> int:
 
 def _get_str(name: str, default: str) -> str:
     v = os.getenv(name)
-    return v if v is not None and v != "" else default
+    return v.strip() if v is not None and v != "" else default
+
+
+def _is_ascii_symbol(s: str) -> bool:
+    return bool(s) and all(c.isascii() and (c.isalnum() or c in "_-") for c in s)
 
 
 def _get_list(name: str, default: List[str]) -> List[str]:
     raw = os.getenv(name)
     if not raw:
         return default
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+    cleaned = []
+    for s in raw.split(","):
+        s = s.strip().upper()
+        if not s:
+            continue
+        if not _is_ascii_symbol(s):
+            raise RuntimeError(
+                f"{name} contains invalid symbol {s!r} — Binance symbols must be "
+                "plain ASCII alphanumerics, e.g. BTCUSDT,ETHUSDT,SOLUSDT"
+            )
+        cleaned.append(s)
+    return cleaned
 
 
 @dataclass

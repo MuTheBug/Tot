@@ -16,11 +16,59 @@ log = logging.getLogger(__name__)
 
 class FuturesExchange:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+        # Strip to defend against stray newlines copied from dashboards.
+        api_key = (api_key or "").strip()
+        api_secret = (api_secret or "").strip()
+        self.testnet = testnet
         self.client = Client(api_key, api_secret, testnet=testnet)
-        if testnet:
-            self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
         self._filters_cache: Dict[str, Dict[str, Any]] = {}
         self._leverage_cache: Dict[str, int] = {}
+        self._valid_symbols: set[str] = set()
+
+    def preflight(self) -> None:
+        """Validate credentials + clock against the futures endpoint.
+
+        Raises a clear RuntimeError instead of letting -1022 leak out of
+        the first trading call.
+        """
+        try:
+            # Signed call that simply tests the key.
+            self.client.futures_account_balance()
+        except BinanceAPIException as e:
+            hint = ""
+            if getattr(e, "code", None) == -1022:
+                network = "TESTNET" if self.testnet else "LIVE"
+                hint = (
+                    f"\n  -> Signature rejected on {network}. Likely causes:\n"
+                    "     * Wrong network: testnet keys (from "
+                    "https://testnet.binancefuture.com) do NOT work on live, "
+                    "and live keys do NOT work on testnet. Check BINANCE_TESTNET.\n"
+                    "     * Whitespace/newline in BINANCE_API_SECRET.\n"
+                    "     * API key missing Futures Trading permission.\n"
+                    "     * System clock skew > 1s (run `ntpdate` / enable NTP)."
+                )
+            elif getattr(e, "code", None) == -2015:
+                hint = (
+                    "\n  -> -2015: Invalid API-key, IP, or permission. Check "
+                    "the key is enabled for Futures and your IP whitelist."
+                )
+            raise RuntimeError(f"Binance auth preflight failed: {e}{hint}") from e
+
+    def validate_symbols(self, symbols: list[str]) -> list[str]:
+        """Return the subset of `symbols` that are actual USDT-M futures
+        trading pairs. Unknown ones are dropped with a warning."""
+        if not self._valid_symbols:
+            info = self.client.futures_exchange_info()
+            self._valid_symbols = {
+                s["symbol"] for s in info["symbols"]
+                if s.get("status") == "TRADING" and s.get("contractType") == "PERPETUAL"
+            }
+        good, bad = [], []
+        for s in symbols:
+            (good if s in self._valid_symbols else bad).append(s)
+        if bad:
+            log.warning("Unknown/invalid Binance futures symbols, skipping: %s", bad)
+        return good
 
     # ---------- symbol info / filters ----------
     def symbol_filters(self, symbol: str) -> Dict[str, Any]:

@@ -37,6 +37,26 @@ def main() -> int:
     store = Store()
 
     try:
+        ex.preflight()
+    except Exception as e:  # noqa: BLE001
+        tg.event("Startup auth failed", str(e), "❌")
+        log.error("Auth preflight failed: %s", e)
+        return 3
+
+    good_symbols = ex.validate_symbols(cfg.symbols)
+    if not good_symbols:
+        tg.event(
+            "Startup error — no valid symbols",
+            f"Configured SYMBOLS={cfg.symbols}. Use e.g. BTCUSDT,ETHUSDT,SOLUSDT.",
+            "❌",
+        )
+        return 4
+    if len(good_symbols) != len(cfg.symbols):
+        dropped = sorted(set(cfg.symbols) - set(good_symbols))
+        tg.event("Ignoring invalid symbols", f"Dropped: {dropped}", "⚠️")
+    cfg.symbols = good_symbols
+
+    try:
         bal = ex.wallet_balance_usdt()
     except Exception as e:  # noqa: BLE001
         tg.event("Startup error", f"Could not read wallet balance: {e}", "❌")
