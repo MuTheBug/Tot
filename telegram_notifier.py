@@ -42,3 +42,29 @@ class TelegramNotifier:
         if body:
             msg += f"\n{body}"
         self.send(msg)
+
+    def send_photo(self, image_bytes: bytes, caption: str = "", silent: bool = False) -> None:
+        """Send a PNG image via sendPhoto. Falls back to text on failure."""
+        if not self.token or not self.chat_id:
+            log.info("[TG disabled] photo (%d bytes) caption=%s", len(image_bytes), caption)
+            return
+        files = {"photo": ("chart.png", image_bytes, "image/png")}
+        data = {
+            "chat_id": self.chat_id,
+            "caption": caption[:1024],
+            "parse_mode": "HTML",
+            "disable_notification": silent,
+        }
+        for attempt in range(3):
+            try:
+                r = requests.post(f"{self.base}/sendPhoto", data=data, files=files, timeout=20)
+                if r.status_code == 200:
+                    return
+                log.warning("Telegram sendPhoto failed (%s): %s", r.status_code, r.text)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Telegram photo network error: %s", e)
+            time.sleep(1.5 * (attempt + 1))
+        # Final fallback: send the caption as a regular message so we don't
+        # silently lose the alert.
+        if caption:
+            self.send(caption)

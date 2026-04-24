@@ -7,6 +7,7 @@ from typing import Optional
 
 import pandas as pd
 
+from chart import render_exit_chart, render_signal_chart
 from config import Config
 from exchange import FuturesExchange
 from risk import calc_sizing
@@ -139,17 +140,35 @@ class SymbolTrader:
         if self.cfg.hedge_mode:
             pos_side = "LONG" if side_order == "BUY" else "SHORT"
 
-        body = (
-            f"Symbol: <b>{self.symbol}</b>\n"
+        explain_lines = [
+            "🔵 <b>Action line</b> — entry trigger (the trendline price respected/broke).",
+            "🟠 <b>Safety line</b> — stop / exit on close-through.",
+        ]
+        if sig.safety_line is sig.action_line:
+            explain_lines = [
+                "🔵 <b>Action line = Safety line</b> — bounce setup, stop trails along this trendline.",
+            ]
+        explain = "\n".join(explain_lines)
+
+        caption = (
+            f"🎯 <b>Signal — {sig.side} {self.symbol}</b>\n"
             f"Setup: <b>{sig.setup}</b>  ({sig.note})\n"
-            f"Side: <b>{sig.side}</b>  TF: {self.cfg.timeframe}\n"
-            f"Entry: {entry:.6g}\n"
-            f"Stop (safety line): {stop:.6g}\n"
+            f"TF: {self.cfg.timeframe}\n"
+            f"Entry: <b>{entry:.6g}</b>\n"
+            f"Stop (safety line): <b>{stop:.6g}</b>\n"
             f"Qty: {qty}  Notional: {sizing.notional:.2f} USDT\n"
             f"Leverage: <b>x{sizing.leverage}</b>  Margin: {sizing.margin:.2f} USDT\n"
-            f"$ risk if SL: {sizing.risk_usdt:.2f} USDT ({self.cfg.risk_per_trade:.2%} of balance)"
+            f"$ risk if SL: {sizing.risk_usdt:.2f} USDT ({self.cfg.risk_per_trade:.2%} of bal)\n\n"
+            f"{explain}"
         )
-        self.tg.event("Signal", body, "🎯")
+
+        # Render and send the annotated chart. Fall back to plain text on failure.
+        try:
+            png = render_signal_chart(df, sig, self.symbol, self.cfg.timeframe)
+            self.tg.send_photo(png, caption=caption)
+        except Exception as e:  # noqa: BLE001
+            log.warning("chart render failed for %s: %s", self.symbol, e)
+            self.tg.event("Signal", caption, "🎯")
 
         if self.cfg.dry_run:
             self.tg.event("DRY RUN — not placing order", self.symbol, "🧪")
@@ -221,18 +240,44 @@ class SymbolTrader:
         )
         self.store.put(mt)
 
+    # --------- exit chart ----------
+    def _send_exit_chart(self, df: pd.DataFrame, trade: ManagedTrade,
+                         exit_price: float, reason: str) -> None:
+        try:
+            png = render_exit_chart(
+                df,
+                symbol=self.symbol, timeframe=self.cfg.timeframe,
+                side=trade.side, setup=trade.setup,
+                entry_price=trade.entry_price,
+                exit_price=exit_price,
+                stop_price=trade.stop_price,
+                line_kind=trade.line_kind,
+                line_slope=trade.line_slope,
+                line_intercept=trade.line_intercept,
+                opened_bar_idx=trade.opened_bar_idx,
+            )
+            pnl = self._rough_pnl(trade, exit_price)
+            caption = (
+                f"🏁 <b>{self.symbol} {trade.side} closed</b>\n"
+                f"Setup: {trade.setup}  ·  Reason: <b>{reason}</b>\n"
+                f"Entry: {trade.entry_price:.6g}  →  Exit: <b>{exit_price:.6g}</b>\n"
+                f"Stop was at: {trade.stop_price:.6g}\n"
+                f"Estimated PnL: <b>{pnl:+.4f} USDT</b>\n\n"
+                f"⬛ <b>Black ✕</b>  exit point\n"
+                f"{'🟢 ▲' if trade.side == 'LONG' else '🔴 ▼'}  entry point\n"
+                f"Coloured line = trendline used as the safety line."
+            )
+            self.tg.send_photo(png, caption=caption)
+        except Exception as e:  # noqa: BLE001
+            log.warning("exit chart failed for %s: %s", self.symbol, e)
+
     # --------- managing an open trade ---------
     def _manage_open_trade(self, df: pd.DataFrame, trade: ManagedTrade) -> None:
         # If exchange reports no open position, the stop must have fired (or
         # the user intervened).  Clean up local state + alert.
         if not self.ex.has_open_position(self.symbol):
-            pnl_hint = self._rough_pnl(trade, float(df.iloc[-1]["close"]))
-            self.tg.event(
-                "Position closed",
-                f"{self.symbol} {trade.side} entry={trade.entry_price:.6g} "
-                f"last={df.iloc[-1]['close']:.6g}\nEst. PnL: {pnl_hint:+.2f} USDT",
-                "🏁",
-            )
+            last_close = float(df.iloc[-1]["close"])
+            self._send_exit_chart(df, trade, last_close, "exchange stop hit / external close")
             self.ex.cancel_all(self.symbol)
             self.store.drop(self.symbol)
             return
@@ -253,7 +298,7 @@ class SymbolTrader:
                     f"{self.symbol} {trade.side} mark={mark:.6g} SL={trade.stop_price:.6g}",
                     "🛑",
                 )
-                self._close_now(trade)
+                self._close_now(trade, df=df, exit_price=mark, reason="software stop hit")
                 return
 
         # Check whether the ACTION LINE has been violated on close (break
@@ -274,7 +319,8 @@ class SymbolTrader:
                 f"{self.symbol} {trade.side} close={last['close']:.6g} line={line_val:.6g}",
                 "🚪",
             )
-            self._close_now(trade)
+            self._close_now(trade, df=df, exit_price=float(last["close"]),
+                            reason="close through safety line")
             return
 
         # Trail stop: move it to the line value at the most-recent bar,
@@ -340,7 +386,10 @@ class SymbolTrader:
             "🧵",
         )
 
-    def _close_now(self, trade: ManagedTrade) -> None:
+    def _close_now(self, trade: ManagedTrade, *,
+                   df: Optional[pd.DataFrame] = None,
+                   exit_price: Optional[float] = None,
+                   reason: str = "rule exit") -> None:
         opp = "SELL" if trade.side == "LONG" else "BUY"
         pos_side = trade.side if self.cfg.hedge_mode else None
         try:
@@ -353,7 +402,11 @@ class SymbolTrader:
         except Exception as e:  # noqa: BLE001
             self.tg.event("Manual close FAILED", f"{self.symbol}: {e}", "❌")
             return
-        self.tg.event("Position closed by rule", self.symbol, "🏁")
+        # Chart-with-explanation if we have the candles handy.
+        if df is not None and exit_price is not None:
+            self._send_exit_chart(df, trade, exit_price, reason)
+        else:
+            self.tg.event("Position closed by rule", self.symbol, "🏁")
         self.store.drop(self.symbol)
 
     def _rough_pnl(self, trade: ManagedTrade, last_price: float) -> float:
