@@ -117,6 +117,9 @@ class SymbolTrader:
 
         side_order = "BUY" if sig.side == "BUY" else "SELL"
         opp = "SELL" if side_order == "BUY" else "BUY"
+        pos_side = None
+        if self.cfg.hedge_mode:
+            pos_side = "LONG" if side_order == "BUY" else "SHORT"
 
         body = (
             f"Symbol: <b>{self.symbol}</b>\n"
@@ -139,19 +142,29 @@ class SymbolTrader:
 
         # Entry MARKET order
         try:
-            self.ex.market_order(self.symbol, side_order, qty)
+            self.ex.market_order(self.symbol, side_order, qty, position_side=pos_side)
         except Exception as e:  # noqa: BLE001
             self.tg.event("Entry order FAILED", f"{self.symbol}: {e}", "❌")
             return
         self.tg.event("Entry filled", f"{self.symbol} {side_order} {qty} @~{entry:.6g}", "✅")
 
-        # Protective stop (close-position STOP_MARKET at safety line)
+        # Protective stop at the safety line. Pass qty so the exchange
+        # wrapper can fall back to a reduce-only stop if the
+        # closePosition variant is rejected with -4120 / -1106.
         try:
-            self.ex.stop_market(self.symbol, opp, stop_price=stop, close_position=True)
+            self.ex.stop_market(
+                self.symbol, opp,
+                stop_price=stop, close_position=True,
+                qty=qty, position_side=pos_side,
+            )
         except Exception as e:  # noqa: BLE001
             self.tg.event("Stop-loss placement FAILED — closing position", f"{self.symbol}: {e}", "❌")
             try:
-                self.ex.market_order(self.symbol, opp, qty, reduce_only=True)
+                self.ex.market_order(
+                    self.symbol, opp, qty,
+                    reduce_only=not self.cfg.hedge_mode,
+                    position_side=pos_side,
+                )
             except Exception:
                 pass
             return
@@ -233,9 +246,14 @@ class SymbolTrader:
         # Only push a new SL order if it moved meaningfully
         if abs(new_stop - trade.stop_price) / max(trade.stop_price, 1e-9) > 0.001:
             opp = "SELL" if trade.side == "LONG" else "BUY"
+            pos_side = trade.side if self.cfg.hedge_mode else None
             try:
                 self.ex.cancel_all(self.symbol)
-                self.ex.stop_market(self.symbol, opp, stop_price=new_stop, close_position=True)
+                self.ex.stop_market(
+                    self.symbol, opp,
+                    stop_price=new_stop, close_position=True,
+                    qty=trade.quantity, position_side=pos_side,
+                )
             except Exception as e:  # noqa: BLE001
                 self.tg.event("Trail stop update FAILED", f"{self.symbol}: {e}", "⚠️")
                 return
@@ -249,9 +267,14 @@ class SymbolTrader:
 
     def _close_now(self, trade: ManagedTrade) -> None:
         opp = "SELL" if trade.side == "LONG" else "BUY"
+        pos_side = trade.side if self.cfg.hedge_mode else None
         try:
             self.ex.cancel_all(self.symbol)
-            self.ex.market_order(self.symbol, opp, trade.quantity, reduce_only=True)
+            self.ex.market_order(
+                self.symbol, opp, trade.quantity,
+                reduce_only=not self.cfg.hedge_mode,
+                position_side=pos_side,
+            )
         except Exception as e:  # noqa: BLE001
             self.tg.event("Manual close FAILED", f"{self.symbol}: {e}", "❌")
             return

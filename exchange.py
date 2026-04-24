@@ -70,6 +70,24 @@ class FuturesExchange:
             log.warning("Unknown/invalid Binance futures symbols, skipping: %s", bad)
         return good
 
+    def top_volume_symbols(self, limit: int) -> list[str]:
+        """Top-N USDT-M perpetual symbols by 24h quote volume.
+
+        Excludes anything that isn't currently trading or isn't a perpetual,
+        and restricts to USDT-quoted pairs (skips USDC-margined / BUSD / etc).
+        """
+        # warm the perpetual set
+        self.validate_symbols([])
+        tickers = self.client.futures_ticker()
+        ranked = sorted(
+            (t for t in tickers
+             if t["symbol"] in self._valid_symbols
+             and t["symbol"].endswith("USDT")),
+            key=lambda t: float(t.get("quoteVolume", 0)),
+            reverse=True,
+        )
+        return [t["symbol"] for t in ranked[:limit]]
+
     # ---------- symbol info / filters ----------
     def symbol_filters(self, symbol: str) -> Dict[str, Any]:
         if symbol in self._filters_cache:
@@ -148,6 +166,13 @@ class FuturesExchange:
         return bool(p) and float(p.get("positionAmt", 0)) != 0.0
 
     # ---------- configuration ----------
+    def is_hedge_mode(self) -> bool:
+        try:
+            return bool(self.client.futures_get_position_mode().get("dualSidePosition"))
+        except BinanceAPIException as e:
+            log.warning("position mode lookup failed: %s", e)
+            return False
+
     def set_leverage(self, symbol: str, leverage: int) -> None:
         if self._leverage_cache.get(symbol) == leverage:
             return
@@ -166,28 +191,57 @@ class FuturesExchange:
                 log.warning("set_margin_type(%s,%s) failed: %s", symbol, margin_type, e)
 
     # ---------- orders ----------
-    def market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> Dict[str, Any]:
+    def market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False,
+                     position_side: Optional[str] = None) -> Dict[str, Any]:
         params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty)
-        if reduce_only:
+        if position_side:
+            params["positionSide"] = position_side
+        elif reduce_only:
             params["reduceOnly"] = "true"
         return self.client.futures_create_order(**params)
 
     def stop_market(self, symbol: str, side: str, stop_price: float, close_position: bool = True,
-                    qty: Optional[float] = None) -> Dict[str, Any]:
-        params = dict(
-            symbol=symbol,
-            side=side,
-            type="STOP_MARKET",
-            stopPrice=self.round_price(symbol, stop_price),
-            workingType="MARK_PRICE",
-            timeInForce="GTE_GTC",
-        )
-        if close_position:
-            params["closePosition"] = "true"
-        else:
-            params["quantity"] = qty
-            params["reduceOnly"] = "true"
-        return self.client.futures_create_order(**params)
+                    qty: Optional[float] = None,
+                    position_side: Optional[str] = None) -> Dict[str, Any]:
+        """Place a STOP_MARKET. Some Binance accounts reject the
+        `closePosition=true` variant with -4120 ("use Algo Order API") when
+        extra parameters like timeInForce/workingType are included — so we
+        send the minimal param set and fall back to a plain reduce-only
+        stop with explicit quantity if the closePosition form is refused.
+        """
+        stop_price = self.round_price(symbol, stop_price)
+
+        def _place(close_pos: bool) -> Dict[str, Any]:
+            params = dict(
+                symbol=symbol,
+                side=side,
+                type="STOP_MARKET",
+                stopPrice=stop_price,
+            )
+            if position_side:
+                params["positionSide"] = position_side
+            if close_pos:
+                params["closePosition"] = "true"
+            else:
+                if qty is None or qty <= 0:
+                    raise ValueError("quantity required for non-closePosition stop")
+                params["quantity"] = qty
+                if not position_side:  # in hedge mode, reduceOnly is implicit
+                    params["reduceOnly"] = "true"
+            return self.client.futures_create_order(**params)
+
+        try:
+            return _place(close_position)
+        except BinanceAPIException as e:
+            # -4120: "use Algo Order API" — retry with explicit qty instead
+            # -1106: "parameter ... sent when not required" — same fix
+            if getattr(e, "code", None) in (-4120, -1106) and close_position and qty and qty > 0:
+                log.warning(
+                    "stop_market closePosition rejected (%s); retrying with quantity-based reduce-only",
+                    e,
+                )
+                return _place(close_pos=False)
+            raise
 
     def cancel_all(self, symbol: str) -> None:
         try:

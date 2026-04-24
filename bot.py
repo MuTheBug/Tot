@@ -43,11 +43,24 @@ def main() -> int:
         log.error("Auth preflight failed: %s", e)
         return 3
 
+    # SYMBOLS=AUTO -> populate from top-N by 24h volume
+    if cfg.symbols == ["AUTO"]:
+        try:
+            cfg.symbols = ex.top_volume_symbols(cfg.top_volume_count)
+        except Exception as e:  # noqa: BLE001
+            tg.event("Startup error — could not fetch top-volume symbols", str(e), "❌")
+            return 5
+        tg.event(
+            "Auto-selected top-volume symbols",
+            f"Using top {len(cfg.symbols)} by 24h volume: {', '.join(cfg.symbols[:10])}…",
+            "📊",
+        )
+
     good_symbols = ex.validate_symbols(cfg.symbols)
     if not good_symbols:
         tg.event(
             "Startup error — no valid symbols",
-            f"Configured SYMBOLS={cfg.symbols}. Use e.g. BTCUSDT,ETHUSDT,SOLUSDT.",
+            f"Configured SYMBOLS={cfg.symbols}. Use e.g. BTCUSDT,ETHUSDT,SOLUSDT or AUTO.",
             "❌",
         )
         return 4
@@ -56,6 +69,8 @@ def main() -> int:
         tg.event("Ignoring invalid symbols", f"Dropped: {dropped}", "⚠️")
     cfg.symbols = good_symbols
 
+    cfg.hedge_mode = ex.is_hedge_mode()
+
     try:
         bal = ex.wallet_balance_usdt()
     except Exception as e:  # noqa: BLE001
@@ -63,10 +78,14 @@ def main() -> int:
         log.error("Startup failed: %s", e)
         return 3
 
+    sym_preview = ", ".join(cfg.symbols[:12])
+    if len(cfg.symbols) > 12:
+        sym_preview += f" … (+{len(cfg.symbols) - 12} more)"
     tg.event(
         "Tori Trendline bot online",
         f"Mode: {'TESTNET' if cfg.testnet else 'LIVE'}  DryRun: {cfg.dry_run}\n"
-        f"Symbols: {', '.join(cfg.symbols)}\n"
+        f"Hedge mode: {'ON' if cfg.hedge_mode else 'OFF'}\n"
+        f"Symbols ({len(cfg.symbols)}): {sym_preview}\n"
         f"TF: {cfg.timeframe}   Risk: {cfg.risk_per_trade:.2%}\n"
         f"Leverage cap: x{cfg.max_leverage}\n"
         f"Balance: {bal:.2f} USDT",

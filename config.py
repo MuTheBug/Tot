@@ -40,6 +40,9 @@ def _get_list(name: str, default: List[str]) -> List[str]:
     raw = os.getenv(name)
     if not raw:
         return default
+    # Special value: "AUTO" means "populate from top-N symbols by volume at startup".
+    if raw.strip().upper() == "AUTO":
+        return ["AUTO"]
     cleaned = []
     for s in raw.split(","):
         s = s.strip().upper()
@@ -82,8 +85,13 @@ class Config:
     )
     candle_limit: int = field(default_factory=lambda: _get_int("CANDLE_LIMIT", 500))
 
+    top_volume_count: int = field(default_factory=lambda: _get_int("TOP_VOLUME_COUNT", 50))
+
     poll_interval: int = field(default_factory=lambda: _get_int("POLL_INTERVAL", 60))
     dry_run: bool = field(default_factory=lambda: _get_bool("DRY_RUN", False))
+
+    # Populated at runtime (not from env)
+    hedge_mode: bool = False
 
     def validate(self) -> None:
         missing = []
