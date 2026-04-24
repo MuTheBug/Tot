@@ -150,13 +150,18 @@ class SymbolTrader:
 
         # Protective stop at the safety line. Pass qty so the exchange
         # wrapper can fall back to a reduce-only stop if the
-        # closePosition variant is rejected with -4120 / -1106.
+        # closePosition variant is rejected with -4120 / -1106. If the
+        # exchange refuses STOP_MARKET entirely, stop_market() returns
+        # None and we manage the stop in software on subsequent ticks.
+        software_stop = False
         try:
-            self.ex.stop_market(
+            sl_order = self.ex.stop_market(
                 self.symbol, opp,
                 stop_price=stop, close_position=True,
                 qty=qty, position_side=pos_side,
             )
+            if sl_order is None:
+                software_stop = True
         except Exception as e:  # noqa: BLE001
             self.tg.event("Stop-loss placement FAILED — closing position", f"{self.symbol}: {e}", "❌")
             try:
@@ -168,7 +173,15 @@ class SymbolTrader:
             except Exception:
                 pass
             return
-        self.tg.event("Stop placed", f"{self.symbol} SL @ {stop:.6g}", "🛡️")
+        if software_stop:
+            self.tg.event(
+                "Software stop armed",
+                f"{self.symbol} SL @ {stop:.6g} — exchange refused STOP_MARKET, "
+                "bot will market-close on mark-price breach.",
+                "🛡️",
+            )
+        else:
+            self.tg.event("Stop placed", f"{self.symbol} SL @ {stop:.6g}", "🛡️")
 
         # Persist trade + trendline for trailing
         line = sig.safety_line
@@ -186,6 +199,7 @@ class SymbolTrader:
             line_intercept=line.intercept,
             line_first_idx=line.first_idx,
             opened_bar_idx=len(df) - 1,
+            software_stop=software_stop,
         )
         self.store.put(mt)
 
@@ -204,6 +218,25 @@ class SymbolTrader:
             self.ex.cancel_all(self.symbol)
             self.store.drop(self.symbol)
             return
+
+        # Software-managed stop: poll mark price against the stored
+        # stop_price and market-close if breached. This is the fallback
+        # for accounts that reject STOP_MARKET entirely.
+        if trade.software_stop:
+            try:
+                mark = self.ex.mark_price(self.symbol)
+            except Exception:  # noqa: BLE001
+                mark = float(df.iloc[-1]["close"])
+            breached = (trade.side == "LONG" and mark <= trade.stop_price) or \
+                       (trade.side == "SHORT" and mark >= trade.stop_price)
+            if breached:
+                self.tg.event(
+                    "Software stop triggered",
+                    f"{self.symbol} {trade.side} mark={mark:.6g} SL={trade.stop_price:.6g}",
+                    "🛑",
+                )
+                self._close_now(trade)
+                return
 
         # Check whether the ACTION LINE has been violated on close (break
         # setup exit rule & bounce exit rule both say: close through the line
@@ -243,27 +276,51 @@ class SymbolTrader:
             new_stop = min(new_stop, trade.stop_price)   # only lower (tighter for short)
 
         new_stop = self.ex.round_price(self.symbol, new_stop)
-        # Only push a new SL order if it moved meaningfully
-        if abs(new_stop - trade.stop_price) / max(trade.stop_price, 1e-9) > 0.001:
-            opp = "SELL" if trade.side == "LONG" else "BUY"
-            pos_side = trade.side if self.cfg.hedge_mode else None
-            try:
-                self.ex.cancel_all(self.symbol)
-                self.ex.stop_market(
-                    self.symbol, opp,
-                    stop_price=new_stop, close_position=True,
-                    qty=trade.quantity, position_side=pos_side,
-                )
-            except Exception as e:  # noqa: BLE001
-                self.tg.event("Trail stop update FAILED", f"{self.symbol}: {e}", "⚠️")
-                return
-            self.tg.event(
-                "Trail stop updated",
-                f"{self.symbol} {trade.side} SL: {trade.stop_price:.6g} → {new_stop:.6g}",
-                "🧵",
-            )
+        # Only move the SL if it changed meaningfully
+        if abs(new_stop - trade.stop_price) / max(trade.stop_price, 1e-9) <= 0.001:
+            return
+
+        if trade.software_stop:
+            # No exchange order to replace — just update internal state
+            old = trade.stop_price
             trade.stop_price = new_stop
             self.store.put(trade)
+            self.tg.event(
+                "Trail stop updated (software)",
+                f"{self.symbol} {trade.side} SL: {old:.6g} → {new_stop:.6g}",
+                "🧵",
+            )
+            return
+
+        opp = "SELL" if trade.side == "LONG" else "BUY"
+        pos_side = trade.side if self.cfg.hedge_mode else None
+        try:
+            self.ex.cancel_all(self.symbol)
+            result = self.ex.stop_market(
+                self.symbol, opp,
+                stop_price=new_stop, close_position=True,
+                qty=trade.quantity, position_side=pos_side,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.tg.event("Trail stop update FAILED", f"{self.symbol}: {e}", "⚠️")
+            return
+        # If the wrapper returned None here, the exchange refused STOP_MARKET
+        # entirely — switch this trade to software-managed from now on.
+        if result is None:
+            trade.software_stop = True
+            self.tg.event(
+                "Switched to software stop",
+                f"{self.symbol} SL will be enforced by the bot in software.",
+                "🛡️",
+            )
+        old = trade.stop_price
+        trade.stop_price = new_stop
+        self.store.put(trade)
+        self.tg.event(
+            "Trail stop updated",
+            f"{self.symbol} {trade.side} SL: {old:.6g} → {new_stop:.6g}",
+            "🧵",
+        )
 
     def _close_now(self, trade: ManagedTrade) -> None:
         opp = "SELL" if trade.side == "LONG" else "BUY"

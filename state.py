@@ -26,6 +26,7 @@ class ManagedTrade:
     line_intercept: float
     line_first_idx: int
     opened_bar_idx: int     # bar index in the candle frame at entry time
+    software_stop: bool = False   # True => bot enforces the stop via MARKET close
 
 
 class Store:
@@ -40,8 +41,9 @@ class Store:
         try:
             with open(self.path, "r") as f:
                 raw = json.load(f)
+            valid = {f.name for f in ManagedTrade.__dataclass_fields__.values()}
             for sym, row in raw.items():
-                self._data[sym] = ManagedTrade(**row)
+                self._data[sym] = ManagedTrade(**{k: v for k, v in row.items() if k in valid})
         except Exception:
             self._data = {}
 

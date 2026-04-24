@@ -24,6 +24,12 @@ class FuturesExchange:
         self._filters_cache: Dict[str, Dict[str, Any]] = {}
         self._leverage_cache: Dict[str, int] = {}
         self._valid_symbols: set[str] = set()
+        # Tri-state: None = unknown, True = account accepts closePosition,
+        # False = account rejects it (use qty-based form).
+        self._close_position_supported: Optional[bool] = None
+        # Tri-state: True = STOP_MARKET works, False = stop orders not
+        # accepted at all (bot manages stops in software).
+        self.stop_orders_supported: Optional[bool] = None
 
     def preflight(self) -> None:
         """Validate credentials + clock against the futures endpoint.
@@ -202,12 +208,13 @@ class FuturesExchange:
 
     def stop_market(self, symbol: str, side: str, stop_price: float, close_position: bool = True,
                     qty: Optional[float] = None,
-                    position_side: Optional[str] = None) -> Dict[str, Any]:
-        """Place a STOP_MARKET. Some Binance accounts reject the
-        `closePosition=true` variant with -4120 ("use Algo Order API") when
-        extra parameters like timeInForce/workingType are included — so we
-        send the minimal param set and fall back to a plain reduce-only
-        stop with explicit quantity if the closePosition form is refused.
+                    position_side: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Place a STOP_MARKET; return None if the exchange refuses all
+        stop-order variants (caller should fall back to software stops).
+
+        Some Binance accounts reject `closePosition=true` with -4120
+        ("Algo Order API endpoints instead"). We cache that fact so we
+        stop retrying the unsupported form on every call.
         """
         stop_price = self.round_price(symbol, stop_price)
 
@@ -230,17 +237,51 @@ class FuturesExchange:
                     params["reduceOnly"] = "true"
             return self.client.futures_create_order(**params)
 
+        # Skip the closePosition attempt entirely if we already know this
+        # account rejects it.
+        try_close_position = close_position and (self._close_position_supported is not False)
+
+        if try_close_position:
+            try:
+                result = _place(True)
+                if self._close_position_supported is None:
+                    self._close_position_supported = True
+                self.stop_orders_supported = True
+                return result
+            except BinanceAPIException as e:
+                code = getattr(e, "code", None)
+                if code in (-4120, -1106):
+                    if self._close_position_supported is None:
+                        log.warning(
+                            "Account rejects STOP_MARKET closePosition=true (%s). "
+                            "Using quantity-based reduce-only stops from now on.", e
+                        )
+                    self._close_position_supported = False
+                    # fall through to qty form
+                else:
+                    raise
+
+        # quantity-based reduce-only form
+        if qty is None or qty <= 0:
+            # Caller didn't give us a qty — we can't place any stop.
+            self.stop_orders_supported = False
+            return None
         try:
-            return _place(close_position)
+            result = _place(False)
+            self.stop_orders_supported = True
+            return result
         except BinanceAPIException as e:
-            # -4120: "use Algo Order API" — retry with explicit qty instead
-            # -1106: "parameter ... sent when not required" — same fix
-            if getattr(e, "code", None) in (-4120, -1106) and close_position and qty and qty > 0:
-                log.warning(
-                    "stop_market closePosition rejected (%s); retrying with quantity-based reduce-only",
-                    e,
-                )
-                return _place(close_pos=False)
+            code = getattr(e, "code", None)
+            if code in (-4120, -1106):
+                # Exchange refuses STOP_MARKET in every form on this
+                # account — caller must manage the stop in software.
+                if self.stop_orders_supported is not False:
+                    log.warning(
+                        "Account refuses STOP_MARKET in every form (%s). "
+                        "Falling back to bot-managed software stops.", e
+                    )
+                self.stop_orders_supported = False
+                return None
             raise
 
     def cancel_all(self, symbol: str) -> None:
