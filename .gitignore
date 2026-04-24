@@ -1,0 +1,17 @@
+# Virtualenv / Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local env & runtime state
+.env
+state.json
+state.json.tmp
+*.log
+
+# Editor
+.idea/
+.vscode/
+.DS_Store

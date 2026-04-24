@@ -1,0 +1,151 @@
+"""Thin wrapper around Binance USDT-M Futures (python-binance)."""
+from __future__ import annotations
+
+import logging
+import math
+import time
+from decimal import Decimal, ROUND_DOWN
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+log = logging.getLogger(__name__)
+
+
+class FuturesExchange:
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+        self.client = Client(api_key, api_secret, testnet=testnet)
+        if testnet:
+            self.client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+        self._filters_cache: Dict[str, Dict[str, Any]] = {}
+        self._leverage_cache: Dict[str, int] = {}
+
+    # ---------- symbol info / filters ----------
+    def symbol_filters(self, symbol: str) -> Dict[str, Any]:
+        if symbol in self._filters_cache:
+            return self._filters_cache[symbol]
+        info = self.client.futures_exchange_info()
+        for s in info["symbols"]:
+            if s["symbol"] == symbol:
+                f = {flt["filterType"]: flt for flt in s["filters"]}
+                tick = Decimal(f["PRICE_FILTER"]["tickSize"])
+                step = Decimal(f["LOT_SIZE"]["stepSize"])
+                min_qty = Decimal(f["LOT_SIZE"]["minQty"])
+                # MIN_NOTIONAL lives in a filter called "MIN_NOTIONAL" or "NOTIONAL"
+                min_notional = Decimal("5")
+                for key in ("MIN_NOTIONAL", "NOTIONAL"):
+                    if key in f and "notional" in f[key]:
+                        min_notional = Decimal(f[key]["notional"])
+                        break
+                out = {
+                    "tickSize": tick,
+                    "stepSize": step,
+                    "minQty": min_qty,
+                    "minNotional": min_notional,
+                    "pricePrecision": int(s["pricePrecision"]),
+                    "quantityPrecision": int(s["quantityPrecision"]),
+                }
+                self._filters_cache[symbol] = out
+                return out
+        raise ValueError(f"Symbol {symbol} not found on Binance Futures")
+
+    def round_price(self, symbol: str, price: float) -> float:
+        f = self.symbol_filters(symbol)
+        tick = f["tickSize"]
+        q = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+        return float(q)
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        f = self.symbol_filters(symbol)
+        step = f["stepSize"]
+        q = (Decimal(str(qty)) / step).to_integral_value(rounding=ROUND_DOWN) * step
+        return float(q)
+
+    # ---------- market data ----------
+    def klines(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+        raw = self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        cols = [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades",
+            "taker_buy_base", "taker_buy_quote", "ignore",
+        ]
+        df = pd.DataFrame(raw, columns=cols)
+        for c in ("open", "high", "low", "close", "volume"):
+            df[c] = df[c].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        return df
+
+    def mark_price(self, symbol: str) -> float:
+        return float(self.client.futures_mark_price(symbol=symbol)["markPrice"])
+
+    # ---------- account / positions ----------
+    def wallet_balance_usdt(self) -> float:
+        for b in self.client.futures_account_balance():
+            if b["asset"] == "USDT":
+                return float(b["availableBalance"])
+        return 0.0
+
+    def position(self, symbol: str) -> Dict[str, Any]:
+        data = self.client.futures_position_information(symbol=symbol)
+        for p in data:
+            if p["symbol"] == symbol:
+                return p
+        return {}
+
+    def has_open_position(self, symbol: str) -> bool:
+        p = self.position(symbol)
+        return bool(p) and float(p.get("positionAmt", 0)) != 0.0
+
+    # ---------- configuration ----------
+    def set_leverage(self, symbol: str, leverage: int) -> None:
+        if self._leverage_cache.get(symbol) == leverage:
+            return
+        try:
+            self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            self._leverage_cache[symbol] = leverage
+        except BinanceAPIException as e:
+            log.warning("set_leverage(%s,%s) failed: %s", symbol, leverage, e)
+
+    def set_margin_type(self, symbol: str, margin_type: str) -> None:
+        try:
+            self.client.futures_change_margin_type(symbol=symbol, marginType=margin_type)
+        except BinanceAPIException as e:
+            # -4046 = no need to change margin type (already set)
+            if getattr(e, "code", None) != -4046:
+                log.warning("set_margin_type(%s,%s) failed: %s", symbol, margin_type, e)
+
+    # ---------- orders ----------
+    def market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> Dict[str, Any]:
+        params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty)
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        return self.client.futures_create_order(**params)
+
+    def stop_market(self, symbol: str, side: str, stop_price: float, close_position: bool = True,
+                    qty: Optional[float] = None) -> Dict[str, Any]:
+        params = dict(
+            symbol=symbol,
+            side=side,
+            type="STOP_MARKET",
+            stopPrice=self.round_price(symbol, stop_price),
+            workingType="MARK_PRICE",
+            timeInForce="GTE_GTC",
+        )
+        if close_position:
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = qty
+            params["reduceOnly"] = "true"
+        return self.client.futures_create_order(**params)
+
+    def cancel_all(self, symbol: str) -> None:
+        try:
+            self.client.futures_cancel_all_open_orders(symbol=symbol)
+        except BinanceAPIException as e:
+            log.warning("cancel_all(%s) failed: %s", symbol, e)
+
+    def open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        return self.client.futures_get_open_orders(symbol=symbol)
