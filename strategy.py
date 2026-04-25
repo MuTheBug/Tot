@@ -1,20 +1,39 @@
-"""Trendline detection + bounce/break signals.
+"""Tori Trade's Trendline Strategy — strict implementation.
 
-Implements the Tori Trade's Playbook trendline strategy:
+Mirrors the parametric rules from the methodology deconstruction:
 
-- Action line: where trade is entered
-- Safety line: where trade is exited (stop-loss)
-- Bounce setup: price touches and respects an established trendline.
-  Action line == Safety line (the trendline itself).
-  Requires >= N clean touchpoints and >= 1 week of data between first
-  touchpoint and the entry candle (42 bars on 4h).
-- Break setup: price breaks AND CLOSES through an established trendline.
-  Action line is the broken trendline. Safety line is a new opposing
-  trendline drawn after the break. Invalidated on close beyond the
-  safety line.
+A+ Trendline parameters:
+  * Minimum 3 distinct touchpoints (configurable; 2 allowed for break setups
+    in rare cases, per the doc).
+  * Anchored to candle wicks (highs / lows), never bodies.
+  * Zero price intersection between anchor points: between the first and
+    last touchpoint, neither a wick nor a close may breach the line.
+  * Minimum 6 candles between consecutive touchpoints.
+  * First touchpoint must be at least 3 weeks of bars before entry
+    (126 candles on 4h).
+  * Slope < 45° measured against a 3-month chart window
+    (≈540 candles on 4h).
+
+Bounce setup:
+  * Wait for retrace to the trendline; entry when price touches AND closes
+    on the supportive side.
+  * Action Line == Safety Line.
+  * Stop given a small "standard deviation" buffer beyond the line so
+    routine wicks don't trigger it.
+  * Exit on 4h candle CLOSE through the line.
+
+Break setup:
+  * 4h candle must CLOSE past the action line (a wick alone is insufficient).
+  * Construct a new opposing Safety Line from recent pivots.
+  * Initial stop = the price where the 4th candle after the breakout would
+    geometrically intersect the Safety Line ("4th Candle Rule").
+  * Only ONE attempt per trendline (caller enforces).
+  * Exit on 4h candle CLOSE back through the Safety Line.
 """
 from __future__ import annotations
 
+import hashlib
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -26,7 +45,7 @@ import pandas as pd
 
 @dataclass
 class Pivot:
-    idx: int          # integer bar index
+    idx: int
     price: float
     kind: str         # "high" or "low"
 
@@ -34,14 +53,21 @@ class Pivot:
 @dataclass
 class Trendline:
     kind: str               # "up" (support, connects lows) or "down" (resistance, connects highs)
-    slope: float            # price per bar
-    intercept: float        # price at bar 0
-    touches: List[Pivot]    # chronological touchpoints used to fit
-    first_idx: int          # first touchpoint bar index
-    last_idx: int           # last touchpoint bar index
+    slope: float
+    intercept: float
+    touches: List[Pivot]
+    first_idx: int
+    last_idx: int
 
     def value_at(self, idx: int) -> float:
         return self.slope * idx + self.intercept
+
+    def fingerprint(self) -> str:
+        """Stable hash so the trader can blacklist a line after one attempt."""
+        return hashlib.md5(
+            f"{self.kind}|{round(self.slope, 8)}|{round(self.intercept, 4)}|"
+            f"{self.first_idx}|{self.last_idx}".encode()
+        ).hexdigest()[:12]
 
 
 @dataclass
@@ -49,21 +75,17 @@ class Signal:
     side: str               # "BUY" or "SELL"
     setup: str              # "bounce" | "break2" | "break3"
     entry_price: float
-    stop_price: float       # safety line value at entry bar
+    stop_price: float
     action_line: Trendline
-    safety_line: Trendline  # same as action for bounce
+    safety_line: Trendline
     note: str = ""
 
 
 # ---------- pivot / swing detection ----------
 
 def find_pivots(df: pd.DataFrame, lookback: int = 3) -> List[Pivot]:
-    """Return confirmed swing highs/lows using a fractal lookback.
-
-    A pivot high at i requires highs[i] strictly greater than the `lookback`
-    bars on both sides. A pivot low uses strictly lower lows on both sides.
-    The last `lookback` bars cannot be confirmed.
-    """
+    """Confirmed swing highs/lows using fractal lookback. Anchors come from
+    candle WICKS (high/low), per the methodology."""
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
     n = len(df)
@@ -89,81 +111,115 @@ def _fit_line(a: Pivot, b: Pivot) -> Tuple[float, float]:
     return slope, intercept
 
 
+def _violates_wick(df: pd.DataFrame, slope: float, intercept: float, kind: str,
+                   start_idx: int, end_idx: int, tolerance_frac: float) -> bool:
+    """Strict wick-based intersection check: between start and end (inclusive),
+    no wick may pierce the line beyond `tolerance_frac`. Per the doc, "the
+    body or wick of a historical candle breaches the line" makes the line
+    structurally compromised.
+    """
+    if end_idx <= start_idx:
+        return False
+    segment = df.iloc[start_idx:end_idx + 1]
+    xs = np.arange(start_idx, end_idx + 1, dtype=float)
+    line = slope * xs + intercept
+    if kind == "up":
+        # Support trendline: low wick should never go below the line.
+        return bool(np.any(segment["low"].to_numpy() < line * (1 - tolerance_frac)))
+    # Downtrend resistance: high wick should never go above the line.
+    return bool(np.any(segment["high"].to_numpy() > line * (1 + tolerance_frac)))
+
+
 def _count_touches(pivots: List[Pivot], kind: str, slope: float, intercept: float,
-                   tolerance_frac: float) -> List[Pivot]:
-    """Pivots that sit ON the line within tolerance, without violating it."""
-    touches: List[Pivot] = []
+                   tolerance_frac: float, min_spacing_bars: int) -> List[Pivot]:
+    """Pivots ON the line within tolerance, with at least `min_spacing_bars`
+    between consecutive touches."""
+    target_kind = "low" if kind == "up" else "high"
+    candidates: List[Pivot] = []
     for p in pivots:
-        if p.kind != kind:
+        if p.kind != target_kind:
             continue
         line_val = slope * p.idx + intercept
         if line_val <= 0:
             continue
-        dist = abs(p.price - line_val) / line_val
-        if dist <= tolerance_frac:
-            touches.append(p)
-    return touches
+        if abs(p.price - line_val) / line_val <= tolerance_frac:
+            candidates.append(p)
+    candidates.sort(key=lambda p: p.idx)
+    # Greedy spacing filter
+    kept: List[Pivot] = []
+    for p in candidates:
+        if not kept or (p.idx - kept[-1].idx) >= min_spacing_bars:
+            kept.append(p)
+    return kept
 
 
-def _violates(df: pd.DataFrame, slope: float, intercept: float, kind: str,
-              start_idx: int, end_idx: int) -> bool:
-    """Between start_idx and end_idx (inclusive), no candle CLOSE may violate the line."""
-    if end_idx <= start_idx:
-        return False
-    segment = df.iloc[start_idx:end_idx + 1]
-    xs = np.arange(start_idx, end_idx + 1)
-    line = slope * xs + intercept
-    closes = segment["close"].to_numpy()
-    if kind == "up":
-        # support: closes below the line invalidate
-        return bool(np.any(closes < line * (1 - 0.001)))
-    # downtrend: closes above invalidate
-    return bool(np.any(closes > line * (1 + 0.001)))
+def _angle_ok(slope: float, df: pd.DataFrame, end_idx: int,
+              max_deg: float, ref_bars: int) -> bool:
+    """Approximate the visual angle: when ~ref_bars candles fill the x axis
+    and the price range over those bars fills the y axis, slope = range/N
+    corresponds to a 45° line. We require |slope| / (range/N) <= tan(max).
+
+    Uses the actual visible segment length (capped at ref_bars), so the
+    test still makes sense when the user has fewer bars loaded than the
+    canonical 3-month window.
+    """
+    start = max(0, end_idx - ref_bars)
+    seg = df.iloc[start:end_idx + 1]
+    seg_len = len(seg)
+    if seg_len < 2:
+        return True
+    price_range = float(seg["high"].max() - seg["low"].min())
+    if price_range <= 0:
+        return True
+    ref_slope = price_range / seg_len
+    if ref_slope <= 0:
+        return True
+    normalized = abs(slope) / ref_slope
+    return normalized <= math.tan(math.radians(max_deg))
 
 
 def build_trendline(df: pd.DataFrame, pivots: List[Pivot], kind: str,
                     min_touches: int, tolerance_frac: float,
-                    min_bars_span: int, end_idx: Optional[int] = None) -> Optional[Trendline]:
-    """Find the best recent trendline of the given kind.
-
-    Strategy: take the two most-recent pivots of the matching kind, try every
-    earlier pivot as the anchor; keep lines with the most touches whose first
-    touchpoint is at least `min_bars_span` before `end_idx` and that no close
-    has violated.  Among equals, prefer the line with the latest anchor (the
-    line is the "freshest").
-    """
+                    min_bars_first_to_end: int,
+                    min_bars_between_taps: int,
+                    max_slope_deg: float,
+                    slope_ref_bars: int,
+                    end_idx: Optional[int] = None) -> Optional[Trendline]:
+    """Find the best A+ trendline of the given kind that obeys every rule."""
     if end_idx is None:
         end_idx = len(df) - 1
-    # relevant pivots for this line kind
     same = [p for p in pivots if p.kind == ("low" if kind == "up" else "high") and p.idx <= end_idx]
     if len(same) < 2:
         return None
 
     best: Optional[Trendline] = None
-
-    # Use the most recent pivot as B, iterate earlier pivots as A.
     B = same[-1]
     for A in same[:-1]:
-        if B.idx - A.idx < min_bars_span:
+        # Rule: first touchpoint at least 3 weeks before "now"
+        if (end_idx - A.idx) < min_bars_first_to_end:
+            continue
+        # Rule: 6 candles between taps (A and B are taps)
+        if (B.idx - A.idx) < min_bars_between_taps:
             continue
         slope, intercept = _fit_line(A, B)
-        # Direction check
         if kind == "up" and slope <= 0:
             continue
         if kind == "down" and slope >= 0:
             continue
-        # No close violations between A and B
-        if _violates(df, slope, intercept, kind, A.idx, B.idx):
+        # Rule: angle < 45° (ish) on the configured reference window
+        if not _angle_ok(slope, df, end_idx, max_slope_deg, slope_ref_bars):
             continue
-        # Count touches among all same-kind pivots in [A, end_idx]
+        # Rule: zero wick intersection between A and B
+        if _violates_wick(df, slope, intercept, kind, A.idx, B.idx, tolerance_frac):
+            continue
+        # Touchpoints with 6-candle spacing
         touches = _count_touches(
             [p for p in same if A.idx <= p.idx <= end_idx],
-            "low" if kind == "up" else "high",
-            slope, intercept, tolerance_frac,
+            kind, slope, intercept, tolerance_frac, min_bars_between_taps,
         )
         if len(touches) < min_touches:
             continue
-        # Keep the line with the most recent anchor that still has enough touches.
+        # Prefer the line with the most touches; tiebreak by latest anchor.
         if best is None or len(touches) > len(best.touches) or (
             len(touches) == len(best.touches) and A.idx > best.first_idx
         ):
@@ -177,25 +233,47 @@ def build_trendline(df: pd.DataFrame, pivots: List[Pivot], kind: str,
 
 # ---------- signal detection ----------
 
-def _bar_touches_line(candle, line_val: float, tolerance_frac: float) -> bool:
-    """True if the candle's range overlaps the line within tolerance."""
-    tol = line_val * tolerance_frac
-    lo, hi = candle["low"], candle["high"]
-    return (lo - tol) <= line_val <= (hi + tol)
+def _build_safety_line(df: pd.DataFrame, pivots: List[Pivot], kind: str,
+                       end_idx: int, tolerance_frac: float,
+                       min_bars_between_taps: int) -> Optional[Trendline]:
+    """For break setups: build the new opposing trendline that becomes the
+    Safety Line. Less strict than an A+ line (post-break the structure is
+    fresh — 2 pivots with proper spacing is acceptable per the doc).
+    """
+    same = [p for p in pivots if p.kind == ("low" if kind == "up" else "high") and p.idx <= end_idx]
+    if len(same) < 2:
+        return None
+    B = same[-1]
+    for A in reversed(same[:-1]):
+        if (B.idx - A.idx) < min_bars_between_taps:
+            continue
+        slope, intercept = _fit_line(A, B)
+        if kind == "up" and slope <= 0:
+            continue
+        if kind == "down" and slope >= 0:
+            continue
+        if _violates_wick(df, slope, intercept, kind, A.idx, B.idx, tolerance_frac * 1.5):
+            continue
+        return Trendline(kind=kind, slope=slope, intercept=intercept,
+                         touches=[A, B], first_idx=A.idx, last_idx=B.idx)
+    return None
 
 
-def detect_signal(df: pd.DataFrame,
+def detect_signal(df: pd.DataFrame, *,
                   pivot_lookback: int,
                   bounce_min_touches: int,
                   break_min_touches: int,
-                  min_bars_span: int,
-                  tolerance_frac: float) -> Optional[Signal]:
-    """Evaluate the JUST-CLOSED candle for a bounce or break entry.
-
-    The bot is called right after a candle closes; we treat df.iloc[-1] as the
-    most-recent confirmed bar.
+                  min_bars_first_to_end: int,
+                  min_bars_between_taps: int,
+                  tolerance_frac: float,
+                  max_slope_deg: float,
+                  slope_ref_bars: int,
+                  bounce_stop_buffer_frac: float,
+                  fourth_candle_offset: int = 4) -> Optional[Signal]:
+    """Evaluate the JUST-CLOSED candle (df.iloc[-1]) for an A+ bounce or
+    break entry per the methodology.
     """
-    if len(df) < min_bars_span + 5:
+    if len(df) < min_bars_first_to_end + 5:
         return None
 
     pivots = find_pivots(df.iloc[:-1], lookback=pivot_lookback)
@@ -205,77 +283,78 @@ def detect_signal(df: pd.DataFrame,
     last = df.iloc[-1]
     last_idx = len(df) - 1
 
-    up = build_trendline(df, pivots, "up",
-                        min_touches=max(bounce_min_touches, break_min_touches),
-                        tolerance_frac=tolerance_frac,
-                        min_bars_span=min_bars_span,
-                        end_idx=last_idx - 1)
-    down = build_trendline(df, pivots, "down",
-                          min_touches=max(bounce_min_touches, break_min_touches),
-                          tolerance_frac=tolerance_frac,
-                          min_bars_span=min_bars_span,
-                          end_idx=last_idx - 1)
+    common = dict(
+        df=df, pivots=pivots,
+        tolerance_frac=tolerance_frac,
+        min_bars_first_to_end=min_bars_first_to_end,
+        min_bars_between_taps=min_bars_between_taps,
+        max_slope_deg=max_slope_deg,
+        slope_ref_bars=slope_ref_bars,
+        end_idx=last_idx - 1,
+    )
+    up = build_trendline(kind="up",
+                         min_touches=max(bounce_min_touches, break_min_touches),
+                         **common)
+    down = build_trendline(kind="down",
+                           min_touches=max(bounce_min_touches, break_min_touches),
+                           **common)
 
-    # --- Break setups first (reversals) ---
-    if up is not None:
+    # --- Break setups (reversal): require full candle BODY close past line ---
+    if up is not None and len(up.touches) >= break_min_touches:
         line_val = up.value_at(last_idx)
-        # Close below uptrend line = break -> SHORT
-        if last["close"] < line_val * (1 - 0.0005) and len(up.touches) >= break_min_touches:
-            # safety line: new opposing DOWN trendline drawn with most recent pivot highs
-            safety = build_trendline(df, pivots, "down",
-                                     min_touches=2, tolerance_frac=tolerance_frac * 1.5,
-                                     min_bars_span=max(3, min_bars_span // 8),
-                                     end_idx=last_idx - 1)
+        if last["close"] < line_val and last["open"] >= line_val * (1 - tolerance_frac):
+            # Confirmed close below uptrend support => SHORT break.
+            safety = _build_safety_line(
+                df, pivots, "down", last_idx - 1,
+                tolerance_frac, min_bars_between_taps,
+            )
             if safety is None:
-                # fallback: last confirmed swing high as a flat safety line
-                highs = [p for p in pivots if p.kind == "high"]
-                if highs:
-                    ph = highs[-1]
-                    safety = Trendline("down", 0.0, ph.price, [ph], ph.idx, ph.idx)
-            if safety is not None:
-                setup = "break3" if len(up.touches) >= 3 else "break2"
-                return Signal(
-                    side="SELL", setup=setup,
-                    entry_price=float(last["close"]),
-                    stop_price=safety.value_at(last_idx),
-                    action_line=up, safety_line=safety,
-                    note=f"{setup} of uptrend line (touches={len(up.touches)})",
-                )
+                # No structural pivots yet — per doc, the rule is to wait. Skip.
+                return None
+            # 4th-Candle Rule for stop: project safety line forward.
+            stop_idx = last_idx + fourth_candle_offset
+            stop_price = safety.value_at(stop_idx)
+            setup = "break3" if len(up.touches) >= 3 else "break2"
+            return Signal(
+                side="SELL", setup=setup,
+                entry_price=float(last["close"]),
+                stop_price=stop_price,
+                action_line=up, safety_line=safety,
+                note=f"{setup} of uptrend (touches={len(up.touches)}, 4th-candle SL)",
+            )
 
-    if down is not None:
+    if down is not None and len(down.touches) >= break_min_touches:
         line_val = down.value_at(last_idx)
-        # Close above downtrend line = break -> LONG
-        if last["close"] > line_val * (1 + 0.0005) and len(down.touches) >= break_min_touches:
-            safety = build_trendline(df, pivots, "up",
-                                     min_touches=2, tolerance_frac=tolerance_frac * 1.5,
-                                     min_bars_span=max(3, min_bars_span // 8),
-                                     end_idx=last_idx - 1)
+        if last["close"] > line_val and last["open"] <= line_val * (1 + tolerance_frac):
+            safety = _build_safety_line(
+                df, pivots, "up", last_idx - 1,
+                tolerance_frac, min_bars_between_taps,
+            )
             if safety is None:
-                lows = [p for p in pivots if p.kind == "low"]
-                if lows:
-                    pl = lows[-1]
-                    safety = Trendline("up", 0.0, pl.price, [pl], pl.idx, pl.idx)
-            if safety is not None:
-                setup = "break3" if len(down.touches) >= 3 else "break2"
-                return Signal(
-                    side="BUY", setup=setup,
-                    entry_price=float(last["close"]),
-                    stop_price=safety.value_at(last_idx),
-                    action_line=down, safety_line=safety,
-                    note=f"{setup} of downtrend line (touches={len(down.touches)})",
-                )
+                return None
+            stop_idx = last_idx + fourth_candle_offset
+            stop_price = safety.value_at(stop_idx)
+            setup = "break3" if len(down.touches) >= 3 else "break2"
+            return Signal(
+                side="BUY", setup=setup,
+                entry_price=float(last["close"]),
+                stop_price=stop_price,
+                action_line=down, safety_line=safety,
+                note=f"{setup} of downtrend (touches={len(down.touches)}, 4th-candle SL)",
+            )
 
-    # --- Bounce setups ---
+    # --- Bounce setups (continuation) ---
     if up is not None and len(up.touches) >= bounce_min_touches:
         line_val = up.value_at(last_idx)
-        # Candle tested the line (low pierced or within tolerance) AND closed above it
+        # Tested the line (low touched within tolerance) AND closed above.
         pierced = last["low"] <= line_val * (1 + tolerance_frac)
         closed_above = last["close"] > line_val
         if pierced and closed_above:
+            stop_price = line_val * (1 - bounce_stop_buffer_frac)
             return Signal(
                 side="BUY", setup="bounce",
                 entry_price=float(last["close"]),
-                stop_price=line_val,   # action line == safety line
+                stop_price=stop_price,
                 action_line=up, safety_line=up,
                 note=f"bounce off uptrend (touches={len(up.touches)})",
             )
@@ -285,24 +364,13 @@ def detect_signal(df: pd.DataFrame,
         pierced = last["high"] >= line_val * (1 - tolerance_frac)
         closed_below = last["close"] < line_val
         if pierced and closed_below:
+            stop_price = line_val * (1 + bounce_stop_buffer_frac)
             return Signal(
                 side="SELL", setup="bounce",
                 entry_price=float(last["close"]),
-                stop_price=line_val,
+                stop_price=stop_price,
                 action_line=down, safety_line=down,
                 note=f"bounce off downtrend (touches={len(down.touches)})",
             )
 
     return None
-
-
-# ---------- trailing stop helper ----------
-
-def trailing_stop(df: pd.DataFrame, side: str, line: Trendline) -> float:
-    """Current price value of the trendline at the most recent bar.
-
-    For a bounce trade the playbook says "trail the stop along the trendline,
-    adjusting below each new valid swing low" — this returns the line value
-    at the last bar; callers can also snap it to a recent swing.
-    """
-    return float(line.value_at(len(df) - 1))

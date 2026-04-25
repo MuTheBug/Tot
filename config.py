@@ -77,13 +77,30 @@ class Config:
     pivot_lookback: int = field(default_factory=lambda: _get_int("PIVOT_LOOKBACK", 3))
     bounce_min_touches: int = field(default_factory=lambda: _get_int("BOUNCE_MIN_TOUCHES", 3))
     break_min_touches: int = field(default_factory=lambda: _get_int("BREAK_MIN_TOUCHES", 2))
-    min_bars_between_touches: int = field(
-        default_factory=lambda: _get_int("MIN_BARS_BETWEEN_TOUCHES", 42)
+    # Doc rule: ≥ 3 weeks of price data first-touch → entry. 3 weeks on 4h = 126 bars.
+    min_bars_first_to_end: int = field(
+        default_factory=lambda: _get_int("MIN_BARS_FIRST_TO_END", 126)
     )
+    # Doc rule: ≥ 6 candles between consecutive touchpoints.
+    min_bars_between_taps: int = field(
+        default_factory=lambda: _get_int("MIN_BARS_BETWEEN_TAPS", 6)
+    )
+    # Doc rule: slope < 45° on a 3-month chart window. 3 months on 4h ≈ 540 bars.
+    max_slope_deg: float = field(default_factory=lambda: _get_float("MAX_SLOPE_DEG", 45.0))
+    slope_ref_bars: int = field(default_factory=lambda: _get_int("SLOPE_REF_BARS", 540))
     trendline_tolerance: float = field(
         default_factory=lambda: _get_float("TRENDLINE_TOLERANCE", 0.0035)
     )
-    candle_limit: int = field(default_factory=lambda: _get_int("CANDLE_LIMIT", 500))
+    # Bounce stop buffer (standard-deviation allowance per doc) so wicks
+    # don't trigger SL prematurely. Fraction of price (0.0015 = 0.15%).
+    bounce_stop_buffer: float = field(
+        default_factory=lambda: _get_float("BOUNCE_STOP_BUFFER", 0.0015)
+    )
+    # 4th Candle Rule: SL = safety line value at (entry_bar + N).
+    fourth_candle_offset: int = field(
+        default_factory=lambda: _get_int("FOURTH_CANDLE_OFFSET", 4)
+    )
+    candle_limit: int = field(default_factory=lambda: _get_int("CANDLE_LIMIT", 700))
 
     top_volume_count: int = field(default_factory=lambda: _get_int("TOP_VOLUME_COUNT", 50))
     max_open_positions: int = field(default_factory=lambda: _get_int("MAX_OPEN_POSITIONS", 1))

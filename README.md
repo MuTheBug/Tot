@@ -7,21 +7,33 @@ still trade on very small accounts.
 
 ---
 
-## What the bot does (strategy, verbatim from the playbook)
+## What the bot does (strict implementation of the methodology)
 
 - Works on the **4-hour** timeframe.
-- Draws trendlines from **confirmed swing highs/lows** (fractal pivots).
-- Two setups, exactly as in the PDF:
-  - **Trendline Bounce** — price touches and respects an established trendline
-    (≥ 3 clean touchpoints by default, ≥ 1 week of data between first
-    touchpoint and entry = 42 bars on 4h).
-    *Action line = Safety line*: stop is the trendline itself; it is trailed
-    along the line and below each new valid swing.
-  - **Trendline Break (2-TP / 3-TP)** — price **closes through** an established
-    trendline. Action line is the broken line; a new **opposing** trendline is
-    drawn as the safety line. Invalidated on a close back through the safety line.
-- Exit rule for both setups: close the position immediately when price **closes
-  through** the safety line.
+- Trendlines are anchored to candle **wicks** (highs / lows), never bodies.
+- An A+ trendline must satisfy **every** parametric rule below; if any rule
+  fails the line is rejected and no trade is taken:
+
+| Rule | Default |
+|---|---|
+| Minimum distinct touchpoints | 3 (bounce) / 2 (break) |
+| Minimum candles **between consecutive touchpoints** | 6 |
+| Minimum candles from first touchpoint to entry (≥ 3 weeks on 4h) | 126 |
+| Slope angle on a 3-month chart view (≈540 4h bars) | < 45° |
+| Wick intersections between anchor points | zero allowed |
+
+- **Trendline Bounce** — price retraces, tests the trendline, and the candle
+  closes on the supportive side. Action Line = Safety Line. The stop is set
+  just beyond the line (`BOUNCE_STOP_BUFFER`, default 0.15%) so routine wicks
+  don't trigger it. Exit on a 4h close *through* the line; trail along the
+  line and beneath each new valid swing.
+- **Trendline Break (2-TP / 3-TP)** — a 4h candle's **body closes through**
+  the trendline (a wick alone is not enough). A fresh opposing trendline
+  becomes the Safety Line. Initial stop uses the **4th-Candle Rule**: the
+  price where the 4th candle after the breakout would intersect the Safety
+  Line (gives ~16 hours of buffer for post-break volatility).
+  Only **one attempt per trendline** — the bot fingerprints each line it
+  takes and refuses to re-enter on the same one.
 
 All signal logic lives in `strategy.py`; the orchestration/trading lives in
 `trader.py`.

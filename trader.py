@@ -27,6 +27,9 @@ class SymbolTrader:
         self.tg = tg
         self.store = store
         self._last_bar_open: Optional[pd.Timestamp] = None
+        # Fingerprints of trendlines we've already taken a single attempt on
+        # (doc rule: one trade per trendline). In-memory; resets on restart.
+        self._spent_lines: set = set()
         self._bootstrap_symbol()
 
     def _bootstrap_symbol(self) -> None:
@@ -84,11 +87,22 @@ class SymbolTrader:
             pivot_lookback=self.cfg.pivot_lookback,
             bounce_min_touches=self.cfg.bounce_min_touches,
             break_min_touches=self.cfg.break_min_touches,
-            min_bars_span=self.cfg.min_bars_between_touches,
+            min_bars_first_to_end=self.cfg.min_bars_first_to_end,
+            min_bars_between_taps=self.cfg.min_bars_between_taps,
             tolerance_frac=self.cfg.trendline_tolerance,
+            max_slope_deg=self.cfg.max_slope_deg,
+            slope_ref_bars=self.cfg.slope_ref_bars,
+            bounce_stop_buffer_frac=self.cfg.bounce_stop_buffer,
+            fourth_candle_offset=self.cfg.fourth_candle_offset,
         )
-        if sig:
-            self._enter(df, sig)
+        if sig is None:
+            return
+        # Doc rule: only ONE trade attempt per trendline.
+        fp = sig.action_line.fingerprint()
+        if fp in self._spent_lines:
+            return
+        self._spent_lines.add(fp)
+        self._enter(df, sig)
 
     # --------- entries ---------
     def _enter(self, df: pd.DataFrame, sig: Signal) -> None:
